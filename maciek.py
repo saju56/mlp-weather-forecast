@@ -27,7 +27,6 @@ def load_and_preprocess(city):
     wind_dir_cos = wind_dir.resample('D', on='datetime')['cos'].mean().rename('wind_dir_cos')
     
     # Weather descriptions (binary flags)
-    # Weather descriptions (binary flags)
     weather = pd.read_csv('weather_description.csv', parse_dates=['datetime'])
     keywords = ['rain', 'snow', 'cloud', 'clear', 'thunderstorm']
     weather[city] = weather[city].fillna('').astype(str)  # Convert all values to strings
@@ -44,6 +43,9 @@ def load_and_preprocess(city):
     features = temp.join(humidity).join(pressure).join(wind_speed_max).join(wind_speed_mean)
     features = features.join(wind_dir_sin).join(wind_dir_cos).join(weather_daily)
     
+    # Add rolling mean for temperature
+    #features['temp_rolling_mean'] = features['temp_mean'].rolling(window=3).mean()
+
     # Create labels (next day's temperature and wind)
     features['temp_target'] = features['temp_mean'].shift(-1)
     features['wind_target'] = (features['wind_speed_max'].shift(-1) >= 10).astype(int)
@@ -51,13 +53,14 @@ def load_and_preprocess(city):
     
     return features
 
-def create_sequences(data, window_size=3):
+
+def create_sequences(data, window_size=3, stride=1):
     X, y_temp, y_wind = [], [], []
-    for i in range(len(data) - window_size):
+    for i in range(0, len(data) - window_size, stride):
         window = data.iloc[i:i+window_size]
-        X.append(window.values.flatten())
-        y_temp.append(data.iloc[i+window_size]['temp_target'])
-        y_wind.append(data.iloc[i+window_size]['wind_target'])
+        X.append(window.values.flatten())  # Flatten the window into a single row
+        y_temp.append(data.iloc[i+window_size]['temp_target'])  # Target for the next day
+        y_wind.append(data.iloc[i+window_size]['wind_target'])  # Binary wind target
     return np.array(X), np.array(y_temp), np.array(y_wind)
 
 # Example for New York
@@ -184,9 +187,21 @@ def plot_log_loss(loss_history, filename='validation_loss_log.png'):
     plt.savefig(filename)
     plt.close()
 
+def plot_predictions(y_true, y_pred, filename='predictions_vs_actual.png'):
+    plt.figure(figsize=(12, 6))
+    plt.plot(y_true, label='Actual', color='blue', alpha=0.7)
+    plt.plot(y_pred, label='Predicted', color='red', alpha=0.7)
+    plt.xlabel('Test Sample Index')
+    plt.ylabel('Temperature (°C)')
+    plt.title('Predicted vs Actual Temperatures')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(filename)
+    plt.close()
+
 # Initialize and train
 input_size = X_train.shape[1]
-model = MLP(input_size, hidden_sizes=[512, 256, 128], output_size=2)
+model = MLP(input_size, hidden_sizes=[256, 128], output_size=2)
 loss_history = model.train(X_train, y_temp_train, y_wind_train, epochs=1000, lr=0.0001)
 
 # Plot and save
@@ -204,3 +219,5 @@ accuracy_within_2deg = (absolute_errors <= 2).mean() * 100
 print(f'Temperature MAE: {mae:.2f}°C')
 print(f'Temperature Accuracy (±2°C): {accuracy_within_2deg:.2f}%')
 print(f'Wind AUC: {auc:.2f}')
+
+plot_predictions(y_temp_test, temp_pred)
