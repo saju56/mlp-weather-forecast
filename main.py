@@ -1,128 +1,188 @@
-import numpy as np
+import os
+import kagglehub
 import pandas as pd
-from sklearn.metrics import mean_absolute_error, roc_auc_score
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-# Load dataset (replace with actual path)
-data = pd.read_csv('historical-hourly-weather-data.csv')
+# Download dataset
+dataset_path = kagglehub.dataset_download("selfishgene/historical-hourly-weather-data")
+print(f"Dataset downloaded to: {dataset_path}")
 
-# Preprocess data
-def preprocess_data(data):
-    data.fillna(method='ffill', inplace=True)
-    data['date'] = pd.to_datetime(data['datetime_column'])
-    data.set_index('date', inplace=True)
-    
-    # Feature engineering: Use past 3 days' data to predict tomorrow
-    for i in range(1, 4):
-        data[f'temp_lag_{i}'] = data['temperature'].shift(i)
-        data[f'wind_lag_{i}'] = data['wind_speed'].shift(i)
-    
-    data['wind_tomorrow'] = (data['wind_speed'].shift(-1) >= 6).astype(int)
-    data.dropna(inplace=True)
-    return data
 
-processed_data = preprocess_data(data)
+# Load and preprocess temperature data
+def load_temperature_data(file_path):
+    df = pd.read_csv(os.path.join(file_path, "temperature.csv"))
 
-# Split features and labels
-features = ['temp_lag_1', 'temp_lag_2', 'temp_lag_3', 'wind_lag_1', 'wind_lag_2', 'wind_lag_3']
-X = processed_data[features].values
-y_temp = processed_data['temperature'].values.reshape(-1, 1)
-y_wind = processed_data['wind_tomorrow'].values.reshape(-1, 1)
+    # Melt to long format
+    melted = df.melt(id_vars=['datetime'], var_name='city', value_name='temperature')
 
-# Train-test split
-X_train, X_test, y_temp_train, y_temp_test, y_wind_train, y_wind_test = train_test_split(
-    X, y_temp, y_wind, test_size=0.2, random_state=42
-)
+    # Convert datetime and filter valid data
+    melted['datetime'] = pd.to_datetime(melted['datetime'])
+    melted = melted[melted['datetime'] >= '2012-10-01 13:00:00']  # Remove initial NaNs
 
-# Scale data
+    # Convert from Kelvin to Celsius and clean data
+    melted['temperature'] = melted['temperature'] - 273.15
+    melted = melted.dropna(subset=['temperature'])  # Remove rows with missing temperatures
+
+    return melted
+
+
+# Load your temperature data
+temp_df = load_temperature_data(dataset_path)
+
+# Create daily aggregates
+daily_data = temp_df.groupby(['city', pd.Grouper(key='datetime', freq='D')]) \
+    .agg({'temperature': 'mean'}) \
+    .reset_index()
+
+
+# Create sequences with proper IIIXO window
+def create_sequences(data, window_size=3, gap=1):
+    sequences = []
+    targets = []
+
+    encoder = OneHotEncoder(sparse_output=False)
+    cities = data['city'].unique()
+    encoder.fit(data[['city']])
+
+    for city in cities:
+        city_df = data[data['city'] == city].sort_values('datetime')
+        city_dates = city_df['datetime'].unique()
+
+        for i in range(len(city_dates) - window_size - gap - 1):
+            # Input: 3 consecutive days
+            input_days = city_df[city_df['datetime'].isin(city_dates[i:i + window_size])]
+
+            # Target: day after gap + window (IIIXO pattern)
+            target_day = city_df[city_df['datetime'] == city_dates[i + window_size + gap]]
+
+            if len(input_days) != window_size or len(target_day) == 0:
+                continue  # Skip incomplete sequences
+
+            # Encode city
+            city_code = encoder.transform([[city]]).flatten()
+
+            # Create features (3 days of temperatures)
+            features = input_days['temperature'].values
+            full_features = np.concatenate([city_code, features])
+
+            sequences.append(full_features)
+            targets.append(target_day['temperature'].values[0])
+
+    return np.array(sequences), np.array(targets)
+
+
+# Create sequences and targets
+# X, y = create_sequences(daily_data)
+# np.save('X_cache.npy', X)
+# np.save('y_cache.npy', y)
+
+X = np.load('X_cache.npy')
+y = np.load('y_cache.npy')
+
+#
+cities = daily_data['city'].unique()
+plt.figure(figsize=(12, 6))
+
+for city in cities:
+    city_data = daily_data[daily_data['city'] == city].sort_values('datetime')
+    plt.plot(city_data['datetime'], city_data['temperature'], label=city, marker='o')
+
+plt.title('Temperature Over Time for Multiple Cities')
+plt.xlabel('Date')
+plt.ylabel('Temperature')
+plt.legend()
+plt.grid(True)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+#
+
+# Train-test split with temporal preservation
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, shuffle=False)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, shuffle=False)
+
+# Normalization (excluding city encoding)
+num_cities = X.shape[1] - 3  # 3 days of temperature data
 scaler = StandardScaler()
-X_train = scaler.fit_transform(X_train)
-X_test = scaler.transform(X_test)
+X_train[:, num_cities:] = scaler.fit_transform(X_train[:, num_cities:])
+X_val[:, num_cities:] = scaler.transform(X_val[:, num_cities:])
+X_test[:, num_cities:] = scaler.transform(X_test[:, num_cities:])
 
-# Define activation functions and derivatives
-def sigmoid(x):
-    return 1 / (1 + np.exp(-x))
+# Convert to PyTorch tensors
+train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
+val_dataset = TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val))
+test_dataset = TensorDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test))
 
-def sigmoid_derivative(x):
-    return x * (1 - x)
 
-def relu(x):
-    return np.maximum(0, x)
+# MLP Model
+class TemperaturePredictor(nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
 
-def relu_derivative(x):
-    return (x > 0).astype(float)
+    def forward(self, x):
+        return self.net(x)
 
-# Define the custom MLP class
-class MLP:
-    def __init__(self, input_size, hidden_sizes, output_size, activation='relu', learning_rate=0.01):
-        self.learning_rate = learning_rate
-        self.activation = relu if activation == 'relu' else sigmoid
-        self.activation_derivative = relu_derivative if activation == 'relu' else sigmoid_derivative
 
-        # Initialize weights and biases
-        self.weights = [
-            np.random.randn(input_size, hidden_sizes[0]),
-            np.random.randn(hidden_sizes[0], hidden_sizes[1]),
-            np.random.randn(hidden_sizes[1], output_size)
-        ]
-        self.biases = [
-            np.zeros((1, hidden_sizes[0])),
-            np.zeros((1, hidden_sizes[1])),
-            np.zeros((1, output_size))
-        ]
+model = TemperaturePredictor(X_train.shape[1])
+optimizer = optim.Adam(model.parameters(), lr=0.01)
+criterion = nn.MSELoss()
 
-    def forward(self, X):
-        self.layer_inputs = []
-        self.layer_outputs = [X]
 
-        for w, b in zip(self.weights, self.biases):
-            X = np.dot(X, w) + b
-            self.layer_inputs.append(X)
-            X = self.activation(X)
-            self.layer_outputs.append(X)
-        
-        return X
+# Training loop
+def train_model(model, train_loader, val_loader, epochs=100):
+    best_mae = float('inf')
+    for epoch in range(epochs):
+        model.train()
+        for X_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            preds = model(X_batch).squeeze()
+            loss = criterion(preds, y_batch)
+            loss.backward()
+            optimizer.step()
 
-    def backward(self, X, y):
-        m = y.shape[0]
-        error = self.layer_outputs[-1] - y
-        deltas = [error * self.activation_derivative(self.layer_outputs[-1])]
+        # Validation
+        model.eval()
+        with torch.no_grad():
+            val_preds = model(val_loader.dataset.tensors[0]).squeeze()
+            val_mae = mean_absolute_error(val_loader.dataset.tensors[1], val_preds)
 
-        for i in range(len(self.weights) - 1, 0, -1):
-            error = deltas[-1].dot(self.weights[i].T)
-            deltas.append(error * self.activation_derivative(self.layer_outputs[i]))
+            if val_mae < best_mae:
+                best_mae = val_mae
+                torch.save(model.state_dict(), 'best_model.pth')
 
-        deltas.reverse()
+        print(f"Epoch {epoch + 1}/{epochs} | Val MAE: {val_mae:.2f}°C")
 
-        # Update weights and biases using SGD
-        for i in range(len(self.weights)):
-            self.weights[i] -= self.learning_rate * self.layer_outputs[i].T.dot(deltas[i]) / m
-            self.biases[i] -= self.learning_rate * np.sum(deltas[i], axis=0, keepdims=True) / m
 
-    def train(self, X, y, epochs=500):
-        for epoch in range(epochs):
-            self.forward(X)
-            self.backward(X, y)
-            if epoch % 50 == 0:
-                loss = np.mean((self.layer_outputs[-1] - y) ** 2)
-                print(f"Epoch {epoch}, Loss: {loss:.4f}")
+# Create data loaders
+batch_size = 64
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size)
+test_loader = DataLoader(test_dataset, batch_size=batch_size)
 
-    def predict(self, X):
-        return self.forward(X)
+# Train the model
+train_model(model, train_loader, val_loader)
 
-# Train and evaluate MLP for temperature prediction
-mlp_temp = MLP(input_size=X_train.shape[1], hidden_sizes=[50, 50], output_size=1, activation='relu', learning_rate=0.01)
-mlp_temp.train(X_train, y_temp_train, epochs=500)
-
-y_temp_pred = mlp_temp.predict(X_test)
-temp_mae = mean_absolute_error(y_temp_test, y_temp_pred)
-print(f"Temperature Prediction MAE: {temp_mae:.2f}")
-
-# Train and evaluate MLP for wind prediction (classification)
-mlp_wind = MLP(input_size=X_train.shape[1], hidden_sizes=[50, 50], output_size=1, activation='sigmoid', learning_rate=0.01)
-mlp_wind.train(X_train, y_wind_train, epochs=500)
-
-y_wind_pred = mlp_wind.predict(X_test)
-wind_auc = roc_auc_score(y_wind_test, y_wind_pred)
-print(f"Wind Prediction AUC: {wind_auc:.2f}")
+# Final evaluation
+model.load_state_dict(torch.load('best_model.pth'))
+with torch.no_grad():
+    test_preds = model(test_loader.dataset.tensors[0]).squeeze()
+    test_mae = mean_absolute_error(test_loader.dataset.tensors[1], test_preds)
+    print(f"\nFinal Test MAE: {test_mae:.2f}°C")
+    print(
+        f"Accuracy: {sum(np.abs(test_preds.numpy() - test_loader.dataset.tensors[1].numpy()) <= 2) / len(test_preds):.1%} of predictions within ±2°C")
