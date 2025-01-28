@@ -57,7 +57,6 @@ def load_and_preprocess(city):
     return features
 
 def create_sequences(data, window_size=3, stride=1):
-    # Funkcja pozostaje bez zmian
     X, y_temp, y_wind = [], [], []
     for i in range(0, len(data) - window_size, stride):
         window = data.iloc[i:i+window_size]
@@ -66,7 +65,6 @@ def create_sequences(data, window_size=3, stride=1):
         y_wind.append(data.iloc[i+window_size]['wind_target'])
     return np.array(X), np.array(y_temp), np.array(y_wind)
 
-# Krok 1: Zbierz dane ze wszystkich miast do pre-treningu
 X_all, y_temp_all, y_wind_all = [], [], []
 for city in ALL_CITIES:
     data = load_and_preprocess(city)
@@ -79,7 +77,6 @@ X_pretrain = np.concatenate(X_all)
 y_temp_pretrain = np.concatenate(y_temp_all)
 y_wind_pretrain = np.concatenate(y_wind_all)
 
-# Podział danych pre-treningowych
 train_size = int(0.7 * len(X_pretrain))
 val_size = int(0.15 * len(X_pretrain))
 X_train, X_val, X_test = (
@@ -98,7 +95,6 @@ y_wind_train, y_wind_val, y_wind_test = (
     y_wind_pretrain[train_size+val_size:]
 )
 
-# Normalizacja na danych pre-treningowych
 scaler = StandardScaler()
 X_train = scaler.fit_transform(X_train)
 X_val = scaler.transform(X_val)
@@ -236,12 +232,10 @@ except FileNotFoundError:
     # Save the model after training
     with open(model_path, 'wb') as f:
         pickle.dump(model, f)
-# Krok 3: Douczanie na konkretnym mieście (np. Seattle)
 target_city = 'Seattle'
 data_target = load_and_preprocess(target_city)
 X_target, yt_target, yw_target = create_sequences(data_target)
 
-# Podział danych docelowych (80/10/10)
 train_size = int(0.8 * len(X_target))
 val_size = int(0.1 * len(X_target))
 X_ft_train, X_ft_val, X_ft_test = (
@@ -260,15 +254,12 @@ yw_ft_train, yw_ft_val, yw_ft_test = (
     yw_target[train_size+val_size:]
 )
 
-# Normalizacja danych docelowych skalą z pre-treningu
 X_ft_train = scaler.transform(X_ft_train)
 X_ft_val = scaler.transform(X_ft_val)
 X_ft_test = scaler.transform(X_ft_test)
 
-# Douczanie z mniejszym learning rate
 finetune_history = model.train(X_ft_train, yt_ft_train, yw_ft_train, epochs=200, lr=0.0001, batch_size=32)
 
-# Ewaluacja na docelowym mieście
 temp_pred, wind_pred = model.forward(X_ft_test)
 mae = mean_absolute_error(yt_ft_test, temp_pred)
 auc = roc_auc_score(yw_ft_test, wind_pred)
