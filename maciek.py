@@ -16,7 +16,6 @@ ALL_CITIES = [
 ]
 
 def load_and_preprocess(city):
-    # Funkcja pozostaje bez zmian
     def load_csv(file, col_name):
         df = pd.read_csv(f'{file}.csv', parse_dates=['datetime'])
         df = df[['datetime', city]].resample('D', on='datetime').mean().rename(columns={city: col_name})
@@ -105,6 +104,7 @@ class MLP:
         self.weights = []
         self.biases = []
         self.val_loss_history = []
+        self.frozen = [False] * (len(hidden_sizes))
         sizes = [input_size] + hidden_sizes + [output_size]
         for i in range(len(sizes)-1):
             # He initialization modified for stability
@@ -113,6 +113,9 @@ class MLP:
             #self.weights.append(np.random.randn(sizes[i], sizes[i+1]) * np.sqrt(2. / sizes[i]))  # He initialization
             self.biases.append(np.zeros(sizes[i+1]))
     
+    def freeze_layer(self, layer_index):
+        self.frozen[layer_index] = True
+
     def relu(self, x):
         return np.maximum(0, x)
     
@@ -162,8 +165,9 @@ class MLP:
         #     grads_b[i] = np.clip(grads_b[i], -clip_value, clip_value)
         # Update weights
         for i in range(len(self.weights)):
-            self.weights[i] -= lr * grads_w[i]
-            self.biases[i] -= lr * grads_b[i]
+            if i > 0 and not self.frozen[i-1]:
+                self.weights[i] -= lr * grads_w[i]
+                self.biases[i] -= lr * grads_b[i]
     
     def train(self, X_train, y_temp, y_wind, epochs=100, lr=0.001, batch_size=32):
         for epoch in range(epochs):
@@ -232,43 +236,74 @@ except FileNotFoundError:
     # Save the model after training
     with open(model_path, 'wb') as f:
         pickle.dump(model, f)
-target_city = 'Seattle'
-data_target = load_and_preprocess(target_city)
-X_target, yt_target, yw_target = create_sequences(data_target)
 
-train_size = int(0.8 * len(X_target))
-val_size = int(0.1 * len(X_target))
-X_ft_train, X_ft_val, X_ft_test = (
-    X_target[:train_size],
-    X_target[train_size:train_size+val_size],
-    X_target[train_size+val_size:]
-)
-yt_ft_train, yt_ft_val, yt_ft_test = (
-    yt_target[:train_size],
-    yt_target[train_size:train_size+val_size],
-    yt_target[train_size+val_size:]
-)
-yw_ft_train, yw_ft_val, yw_ft_test = (
-    yw_target[:train_size],
-    yw_target[train_size:train_size+val_size],
-    yw_target[train_size+val_size:]
-)
+# ... (previous code remains the same until the pretrained model is saved)
 
-X_ft_train = scaler.transform(X_ft_train)
-X_ft_val = scaler.transform(X_ft_val)
-X_ft_test = scaler.transform(X_ft_test)
+# After the pretraining section, add the following code:
 
-finetune_history = model.train(X_ft_train, yt_ft_train, yw_ft_train, epochs=200, lr=0.0001, batch_size=32)
+results = []
 
-temp_pred, wind_pred = model.forward(X_ft_test)
-mae = mean_absolute_error(yt_ft_test, temp_pred)
-auc = roc_auc_score(yw_ft_test, wind_pred)
-accuracy_within_2deg = (np.abs(temp_pred - yt_ft_test) <= 2).mean() * 100
+for city in ALL_CITIES:
+    # Load pretrained model fresh for each city
+    try:
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
+            model.freeze_layer(0)  # Freeze the first layer
+        print(f"Loaded pretrained model for {city}!")
+    except FileNotFoundError:
+        print("Pretrained model not found!")
+        break
+    
+    # Load and preprocess city data
+    data_target = load_and_preprocess(city)
+    X_target, yt_target, yw_target = create_sequences(data_target)
+    
+    # Split into train/val/test (80-10-10)
+    train_size = int(0.8 * len(X_target))
+    val_size = int(0.1 * len(X_target))
+    X_ft_train, X_ft_val, X_ft_test = (
+        X_target[:train_size],
+        X_target[train_size:train_size+val_size],
+        X_target[train_size+val_size:]
+    )
+    yt_ft_train, yt_ft_val, yt_ft_test = (
+        yt_target[:train_size],
+        yt_target[train_size:train_size+val_size],
+        yt_target[train_size+val_size:]
+    )
+    yw_ft_train, yw_ft_val, yw_ft_test = (
+        yw_target[:train_size],
+        yw_target[train_size:train_size+val_size],
+        yw_target[train_size+val_size:]
+    )
+    
+    # Apply scaling
+    X_ft_train = scaler.transform(X_ft_train)
+    X_ft_val = scaler.transform(X_ft_val)
+    X_ft_test = scaler.transform(X_ft_test)
+    
+    # Finetune the model
+    finetune_history = model.train(X_ft_train, yt_ft_train, yw_ft_train, epochs=200, lr=0.00001, batch_size=32)
+    
+    # Evaluate
+    temp_pred, wind_pred = model.forward(X_ft_test)
+    mae = mean_absolute_error(yt_ft_test, temp_pred)
+    auc = roc_auc_score(yw_ft_test, wind_pred)
+    accuracy_within_2deg = (np.abs(temp_pred - yt_ft_test) <= 2).mean() * 100
+    
+    # Save results
+    results.append({
+        'City': city,
+        'MAE': mae,
+        'AUC': auc,
+        'Accuracy_2deg': accuracy_within_2deg
+    })
+    
+    # Generate plots with sanitized city names
+    sanitized_city = city.replace(' ', '_').replace('/', '_')
+    plot_and_save_loss(finetune_history, f'finetune_loss_{sanitized_city}.png')
+    plot_predictions(yt_ft_test, temp_pred, f'finetune_predictions_{sanitized_city}.png')
 
-print(f'[Fine-tuned] MAE: {mae:.2f}°C')
-print(f'[Fine-tuned] Accuracy (±2°C): {accuracy_within_2deg:.2f}%')
-print(f'[Fine-tuned] Wind AUC: {auc:.2f}')
-
-# Wizualizacja
-plot_and_save_loss(finetune_history, 'finetune_loss.png')
-plot_predictions(yt_ft_test, temp_pred, 'finetune_predictions.png')
+# Save metrics to CSV
+results_df = pd.DataFrame(results)
+results_df.to_csv('city_finetune_metrics.csv', index=False)
